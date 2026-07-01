@@ -391,10 +391,41 @@ class SparrowDroneID:
                 print(f"  Monitor:  {interface} not found after {wait_max}s — skipping auto-start")
                 return
 
+        # Read channel hopping settings (fall back to safe defaults)
+        db = self.db
+        from .backend.channel_scheduler import (
+            ChannelMode, parse_channel_list,
+            _DEFAULT_CHANNELS, _DEFAULT_DWELL_MS, _DEFAULT_EXPIRY_S,
+        )
+        channel_mode = (db.get_setting('wifi_channel_mode', ChannelMode.FIXED) or ChannelMode.FIXED).strip()
+        channel_list_raw = (db.get_setting('wifi_channel_list', '') or '').strip()
+        channel_dwell_ms = int(db.get_setting('wifi_channel_dwell_ms', str(_DEFAULT_DWELL_MS)) or _DEFAULT_DWELL_MS)
+        channel_expiry_s = int(db.get_setting('wifi_channel_expiry_s', str(_DEFAULT_EXPIRY_S)) or _DEFAULT_EXPIRY_S)
+
+        if channel_list_raw:
+            try:
+                channel_list = parse_channel_list(channel_list_raw)
+            except ValueError as exc:
+                print(f"  Monitor:  Invalid wifi_channel_list — {exc}; using defaults")
+                channel_list = None
+        else:
+            channel_list = None
+
         try:
-            self.droneid_engine.start(interface)
+            self.droneid_engine.start(
+                interface,
+                channel_mode=channel_mode,
+                channel_list=channel_list,
+                channel_dwell_ms=channel_dwell_ms,
+                channel_expiry_s=channel_expiry_s,
+            )
             self.db.set_setting('monitor_interface', interface)
-            print(f"  Monitor:  {interface} on channel 6")
+            if channel_mode == ChannelMode.FIXED:
+                ch = self.droneid_engine.get_status().get('channel', '?')
+                print(f"  Monitor:  {interface} fixed channel {ch}")
+            else:
+                channels_str = ', '.join(str(c) for c in (channel_list or _DEFAULT_CHANNELS))
+                print(f"  Monitor:  {interface} {channel_mode} hopping [{channels_str}] dwell={channel_dwell_ms}ms")
         except Exception as e:
             print(f"  Monitor:  Failed to start on {interface}: {e}")
 

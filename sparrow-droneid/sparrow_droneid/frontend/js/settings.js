@@ -160,6 +160,65 @@ const SettingsManager = (() => {
             </div>
           </div>
 
+          <!-- Channel Hopping -->
+          <div class="card settings-card mb-3">
+            <div class="card-header">
+              <i class="bi bi-arrow-repeat me-2"></i>Channel Hopping
+            </div>
+            <div class="card-body">
+
+              <div class="mb-3">
+                <label class="form-label" for="s_channel_mode">Mode</label>
+                <select class="form-select form-select-sm" id="s_channel_mode" style="max-width:180px;">
+                  <option value="fixed"    ${_sel(s.wifi_channel_mode || 'fixed', 'fixed')}>Fixed</option>
+                  <option value="scan"     ${_sel(s.wifi_channel_mode || 'fixed', 'scan')}>Scan</option>
+                  <option value="adaptive" ${_sel(s.wifi_channel_mode || 'fixed', 'adaptive')}>Adaptive</option>
+                </select>
+                <small class="text-muted">
+                  <strong>Fixed:</strong> single channel.
+                  <strong>Scan:</strong> round-robin.
+                  <strong>Adaptive:</strong> prioritises channels with recent detections.
+                </small>
+              </div>
+
+              <div id="s_channel_hop_fields" style="display:${(s.wifi_channel_mode && s.wifi_channel_mode !== 'fixed') ? '' : 'none'}">
+
+                <div class="mb-3">
+                  <label class="form-label" for="s_channel_list">Channel List</label>
+                  <input type="text" class="form-control form-control-sm" id="s_channel_list"
+                    value="${_esc(s.wifi_channel_list || '1,6,11')}" style="max-width:180px;"
+                    placeholder="e.g. 1,6,11">
+                  <small class="text-muted">Comma-separated 2.4 GHz channels (1–13). A single radio can only receive one channel at a time — packets on other channels are missed during each dwell period.</small>
+                </div>
+
+                <div class="mb-3">
+                  <label class="form-label" for="s_channel_dwell">Dwell Time (ms)</label>
+                  <input type="number" class="form-control form-control-sm" id="s_channel_dwell"
+                    value="${s.wifi_channel_dwell_ms || 250}" min="50" max="30000" step="50"
+                    style="max-width:120px;">
+                  <small class="text-muted">Time spent on each channel before hopping. Lower = faster scan, but more missed frames per channel.</small>
+                </div>
+
+                <div id="s_adaptive_fields" style="display:${s.wifi_channel_mode === 'adaptive' ? '' : 'none'}">
+                  <div class="mb-0">
+                    <label class="form-label" for="s_channel_expiry">Adaptive Priority Expiry (s)</label>
+                    <input type="number" class="form-control form-control-sm" id="s_channel_expiry"
+                      value="${s.wifi_channel_expiry_s || 300}" min="10" max="86400" step="10"
+                      style="max-width:120px;">
+                    <small class="text-muted">Seconds without a detection before a channel loses its priority boost.</small>
+                  </div>
+                </div>
+
+              </div>
+
+              <small class="text-muted d-block mt-2">
+                <i class="bi bi-info-circle me-1"></i>Channel hopping settings take effect on the next monitor start.
+                Stop and restart monitoring to apply changes immediately.
+              </small>
+
+            </div>
+          </div>
+
           <!-- GPS Configuration -->
           <div class="card settings-card mb-3">
             <div class="card-header">
@@ -1086,6 +1145,15 @@ const SettingsManager = (() => {
       }
     });
 
+    // Channel hopping mode — show/hide conditional fields
+    document.getElementById('s_channel_mode')?.addEventListener('change', e => {
+      const mode = e.target.value;
+      const hopFields = document.getElementById('s_channel_hop_fields');
+      if (hopFields) hopFields.style.display = (mode === 'fixed') ? 'none' : '';
+      const adaptiveFields = document.getElementById('s_adaptive_fields');
+      if (adaptiveFields) adaptiveFields.style.display = (mode === 'adaptive') ? '' : 'none';
+    });
+
     // Operator name — mirror to localStorage so alerts module can read it synchronously
     document.getElementById('s_operator_name')?.addEventListener('change', e => {
       const val = e.target.value.trim();
@@ -1913,6 +1981,12 @@ const SettingsManager = (() => {
     strField  ('s_wifi_ssid_agent_url',     'wifi_ssid_agent_url');
     strField  ('s_wifi_ssid_agent_iface',   'wifi_ssid_agent_interface');
     intField  ('s_wifi_ssid_poll_interval', 'wifi_ssid_poll_interval');
+
+    // Channel hopping
+    strField  ('s_channel_mode',   'wifi_channel_mode');
+    strField  ('s_channel_list',   'wifi_channel_list');
+    intField  ('s_channel_dwell',  'wifi_channel_dwell_ms');
+    intField  ('s_channel_expiry', 'wifi_channel_expiry_s');
 
     // Slack guard: can't enable notifications without a webhook URL
     if (changes.alert_slack_enabled && !changes.alert_slack_webhook_url) {

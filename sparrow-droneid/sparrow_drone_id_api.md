@@ -151,7 +151,7 @@ Enumerate available WiFi interfaces and their capabilities.
 
 ### POST /api/monitor/start
 
-Start Remote ID capture on the specified interface. Switches the interface to monitor mode on channel 6 if not already in monitor mode. BLE capture is started automatically alongside WiFi capture (no additional configuration required).
+Start Remote ID capture on the specified interface. Switches the interface to monitor mode and begins Wi-Fi and BLE capture. Channel hopping parameters are read from the saved settings (see [PUT /api/settings](#put-apisettings)); they cannot be passed in the request body.
 
 **Request body:**
 
@@ -161,6 +161,8 @@ Start Remote ID capture on the specified interface. Switches the interface to mo
 }
 ```
 
+The `channel` field is still accepted for backward compatibility but is ignored when channel hopping is configured.
+
 **Response:**
 
 ```json
@@ -169,14 +171,19 @@ Start Remote ID capture on the specified interface. Switches the interface to mo
   "errmsg": "",
   "interface": "wlan0mon",
   "channel": 6,
+  "channel_hop_mode": "scan",
+  "channel_hop_channels": [1, 6, 11],
   "status": "monitoring"
 }
 ```
+
+`channel_hop_mode` is one of `"fixed"`, `"scan"`, or `"adaptive"`. In fixed mode `channel_hop_channels` contains the single configured channel.
 
 **Error conditions:**
 - Interface not found → `errcode: 2`
 - Interface does not support monitor mode → `errcode: 3`
 - Already monitoring → `errcode: 3`
+- Invalid channel hopping configuration in saved settings → `errcode: 3`
 - tcpdump failed to start → `errcode: 5`
 
 ### POST /api/monitor/stop
@@ -215,9 +222,24 @@ Returns current monitoring session status.
   "droneid_frame_count": 142,
   "ble_enabled": true,
   "ble_frame_count": 38,
-  "capture_errors": 0
+  "capture_errors": 0,
+  "channel_hop_mode": "adaptive",
+  "channel_hop_channels": [1, 6, 11],
+  "channel_hop_dwell_s": 0.25,
+  "channel_hop_active_channels": { "6": 12.3 },
+  "channel_hop_error": ""
 }
 ```
+
+**Channel hopping fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `channel_hop_mode` | string | `"fixed"`, `"scan"`, or `"adaptive"` |
+| `channel_hop_channels` | int[] | Configured channel list |
+| `channel_hop_dwell_s` | float | Dwell time per channel visit in seconds |
+| `channel_hop_active_channels` | object | Adaptive mode: map of `{channel: seconds_since_last_detection}` for channels that currently have elevated priority |
+| `channel_hop_error` | string | Last channel-change error, or empty string |
 
 ---
 
@@ -1068,7 +1090,11 @@ Returns all application settings.
     "tile_cache_enabled": true,
     "monitor_interface": "",
     "airport_geozone_radius_mi": 2.0,
-    "operator_name": ""
+    "operator_name": "",
+    "wifi_channel_mode": "fixed",
+    "wifi_channel_list": "1,6,11",
+    "wifi_channel_dwell_ms": 250,
+    "wifi_channel_expiry_s": 300
   }
 }
 ```
@@ -1100,7 +1126,18 @@ Update one or more settings. Only include the keys you want to change.
 
 **`restart_required`** will be `true` if any of these settings were changed: `port`, `bind_address`, `https_enabled`, `https_cert_path`, `https_key_path`.
 
-**New settings added in this version:**
+**Note on channel hopping settings:** `wifi_channel_mode`, `wifi_channel_list`, `wifi_channel_dwell_ms`, and `wifi_channel_expiry_s` are read at `POST /api/monitor/start` time. They do not change the active session. If you update them while monitoring is running, the response includes a `channel_hop_note` field explaining that monitoring must be restarted to apply the change.
+
+**Channel hopping settings:**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `wifi_channel_mode` | string | `"fixed"` | One of `"fixed"`, `"scan"`, `"adaptive"` |
+| `wifi_channel_list` | string | `"1,6,11"` | Comma-separated 2.4 GHz channel numbers used in scan/adaptive mode |
+| `wifi_channel_dwell_ms` | int | `250` | Milliseconds to dwell on each channel before hopping (50–30000) |
+| `wifi_channel_expiry_s` | int | `300` | Adaptive mode: seconds without a detection before a channel loses priority (10–86400) |
+
+**Other settings added in this version:**
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

@@ -27,6 +27,10 @@ import requests as _requests
 from requests.adapters import HTTPAdapter as _HTTPAdapter
 
 from .droneid_engine import DroneIDEngine, CaptureManager, check_prerequisites
+from .channel_scheduler import (
+    ChannelMode, validate_channel_config, parse_channel_list,
+    _DEFAULT_CHANNELS, _DEFAULT_DWELL_MS, _DEFAULT_EXPIRY_S,
+)
 from .gps_engine import GPSEngine
 from .alert_engine import AlertEngine, maps_pushpin_url
 from .cot_engine import CotEngine
@@ -601,7 +605,8 @@ def _coerce_settings(raw: Dict[str, str]) -> Dict[str, Any]:
         'es_enabled', 'es_verify_tls', 'es_dashboards_verify_tls',
     }
     int_keys = {'port', 'cot_port', 'retention_days',
-                'es_shards', 'es_replicas', 'es_bulk_size', 'es_flush_interval'}
+                'es_shards', 'es_replicas', 'es_bulk_size', 'es_flush_interval',
+                'wifi_channel_dwell_ms', 'wifi_channel_expiry_s'}
     float_keys = {'gps_static_lat', 'gps_static_lon', 'gps_static_alt'}
     # Sensitive fields: show '(set)' if non-empty, '' if empty — never reveal value.
     sensitive_keys = {
@@ -780,8 +785,46 @@ def api_monitor_start(req: RequestHandler):
         req._send_error(400, ErrorCode.VALIDATION_ERROR, f'Interface {interface!r} does not support monitor mode')
         return
 
+    # Read channel hopping configuration from DB settings
+    db = _require_db()
+    channel_mode = db.get_setting_str('wifi_channel_mode', ChannelMode.FIXED).strip() or ChannelMode.FIXED
+    channel_list_raw = db.get_setting_str('wifi_channel_list', '').strip()
+    channel_dwell_ms = int(db.get_setting_str('wifi_channel_dwell_ms', str(_DEFAULT_DWELL_MS)) or _DEFAULT_DWELL_MS)
+    channel_expiry_s = int(db.get_setting_str('wifi_channel_expiry_s', str(_DEFAULT_EXPIRY_S)) or _DEFAULT_EXPIRY_S)
+
+    # Parse channel list (fall back to sensible defaults)
+    if channel_list_raw:
+        try:
+            channel_list = parse_channel_list(channel_list_raw)
+        except ValueError as exc:
+            req._send_error(400, ErrorCode.VALIDATION_ERROR, f'Invalid wifi_channel_list setting: {exc}')
+            return
+    else:
+        channel_list = None  # engine will use defaults per mode
+
+    # Resolve the effective channel list for validation
+    effective_channels = channel_list if channel_list else (
+        [channel] if channel_mode == ChannelMode.FIXED else list(_DEFAULT_CHANNELS)
+    )
+
+    config_errors = validate_channel_config(
+        channel_mode, effective_channels, channel_dwell_ms, channel_expiry_s
+    )
+    if config_errors:
+        req._send_error(
+            400, ErrorCode.VALIDATION_ERROR,
+            'Invalid channel hopping configuration: ' + '; '.join(config_errors),
+        )
+        return
+
     try:
-        _droneid_engine.start(interface, channel)
+        _droneid_engine.start(
+            interface, channel,
+            channel_mode=channel_mode,
+            channel_list=channel_list,
+            channel_dwell_ms=channel_dwell_ms,
+            channel_expiry_s=channel_expiry_s,
+        )
     except RuntimeError as e:
         req._send_error(409, ErrorCode.CONFLICT, str(e))
         return
@@ -793,6 +836,8 @@ def api_monitor_start(req: RequestHandler):
     req._send_ok({
         'interface': status['interface'],
         'channel': status['channel'],
+        'channel_hop_mode': status.get('channel_hop_mode', ChannelMode.FIXED),
+        'channel_hop_channels': status.get('channel_hop_channels', [status['channel']]),
         'status': 'monitoring',
     })
 
@@ -2697,6 +2742,7 @@ _SETTINGS_WRITABLE = frozenset({
     'display_units',
     'vendor_codes_url',
     'wifi_ssid_enabled', 'wifi_ssid_agent_url', 'wifi_ssid_agent_interface', 'wifi_ssid_poll_interval',
+    'wifi_channel_mode', 'wifi_channel_list', 'wifi_channel_dwell_ms', 'wifi_channel_expiry_s',
     'es_enabled', 'es_backend_type', 'es_url', 'es_auth_method',
     'es_username', 'es_password', 'es_api_key', 'es_verify_tls',
     'es_agent_name', 'es_dashboards_url', 'es_dashboards_auth_method',
@@ -2808,6 +2854,13 @@ def api_settings_put(req: RequestHandler):
                 agent_interface=_require_db().get_setting_str('wifi_ssid_agent_interface', '') or '',
             )
 
+    # Channel hopping settings (wifi_channel_*) are read at monitor/start time.
+    # They do not take effect while monitoring is active; a note is added to
+    # the response when they are changed during an active session.
+    channel_hop_keys = {'wifi_channel_mode', 'wifi_channel_list',
+                        'wifi_channel_dwell_ms', 'wifi_channel_expiry_s'}
+    channel_settings_changed = bool(channel_hop_keys & set(data.keys()))
+
     # Apply Elasticsearch engine settings live if any es_* key changed.
     if _es_engine and any(k.startswith('es_') for k in data):
         _es_engine.configure(
@@ -2832,10 +2885,17 @@ def api_settings_put(req: RequestHandler):
     raw = _require_db().get_all_settings()
     coerced = _coerce_settings(raw)
 
-    req._send_ok({
+    resp: dict = {
         'settings': coerced,
         'restart_required': restart_required,
-    })
+    }
+    if channel_settings_changed and _droneid_engine and _droneid_engine.monitoring:
+        resp['channel_hop_note'] = (
+            'Channel hopping settings saved. They will take effect on the next '
+            'monitor/start call; stop and restart monitoring to apply them now.'
+        )
+
+    req._send_ok(resp)
 
 
 # ---------------------------------------------------------------------------

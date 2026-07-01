@@ -23,11 +23,16 @@ def _utcnow_iso_z() -> str:
     return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 import time
 from time import sleep
-from typing import Dict
+from typing import Dict, List, Optional
 
 from .models import (
     DroneIDDevice, WifiInterface, Protocol, UAType,
     rssi_trend as calc_rssi_trend,
+)
+from .channel_scheduler import (
+    ChannelScheduler, ChannelMode, channel_to_freq, freq_to_channel,
+    validate_channel_config, parse_channel_list,
+    _DEFAULT_CHANNELS, _DEFAULT_DWELL_MS, _DEFAULT_EXPIRY_S,
 )
 
 # --------------- Constants ------------------------------------------------
@@ -90,10 +95,13 @@ _RT_FIELD_INFO = [
     (0, 8, 8),   # TSFT
     (1, 1, 1),   # Flags
     (2, 1, 1),   # Rate
-    (3, 4, 2),   # Channel (freq(2) + flags(2))
+    (3, 4, 2),   # Channel (freq(2LE) + flags(2LE))
     (4, 2, 2),   # FHSS
     (5, 1, 1),   # dBm Antenna Signal
 ]
+
+# Bit index in the radiotap present field for the Channel field
+_RT_BIT_CHANNEL = 3
 
 
 # --------------- ODID Message Parser --------------------------------------
@@ -991,6 +999,9 @@ class DroneIDEngine:
         self._parse_thread = None
         self._wifi_restart_lock = threading.Lock()  # serialises start/stop/restart
 
+        # Channel hopping scheduler (None in fixed-channel mode)
+        self._channel_scheduler: Optional[ChannelScheduler] = None
+
         # Counters
         self._frame_count = 0
         self._droneid_frame_count = 0
@@ -1028,19 +1039,52 @@ class DroneIDEngine:
     def monitoring(self):
         return self._monitoring
 
-    def start(self, interface, channel=6):
+    def start(
+        self,
+        interface: str,
+        channel: int = 6,
+        channel_mode: str = ChannelMode.FIXED,
+        channel_list: Optional[List[int]] = None,
+        channel_dwell_ms: int = _DEFAULT_DWELL_MS,
+        channel_expiry_s: int = _DEFAULT_EXPIRY_S,
+    ) -> None:
         """Start monitoring on the given interface.
 
-        Sets up the monitor VIF (once), then calls _start_wifi_capture() and
-        starts the BLE scan thread.  The Supervisor (started externally) will
-        detect stalls and call restart_wifi_capture() / request_ble_rebind()
-        as needed; there is no longer an inline monitor-health-check thread.
+        Parameters
+        ----------
+        interface:
+            WiFi interface name (managed-mode; will be switched to monitor).
+        channel:
+            Initial channel (used for fixed mode, and as the starting channel
+            for scan/adaptive mode when channel_list is not provided).
+        channel_mode:
+            'fixed', 'scan', or 'adaptive'.
+        channel_list:
+            Channels to hop through in scan/adaptive mode.  Defaults to
+            [channel] for fixed, or [1, 6, 11] for scan/adaptive.
+        channel_dwell_ms:
+            Milliseconds to dwell on each channel visit.
+        channel_expiry_s:
+            Adaptive mode: seconds without a detection before a channel loses
+            its priority boost.
         """
         if self._monitoring:
             raise RuntimeError("Already monitoring")
 
-        self._interface = CaptureManager.start_monitor(interface, channel)
-        self._channel = channel
+        # Resolve channel list
+        if channel_list is None:
+            if channel_mode == ChannelMode.FIXED:
+                channels = [channel]
+            else:
+                channels = list(_DEFAULT_CHANNELS)
+        else:
+            channels = list(channel_list)
+
+        # Initial channel: first in the list (also used by start_monitor)
+        initial_channel = channels[0] if channels else channel
+
+        self._interface = CaptureManager.start_monitor(interface, initial_channel)
+        self._channel = initial_channel
         self._monitoring = True
         self._started_at = datetime.now(timezone.utc)
         self._frame_count = 0
@@ -1054,6 +1098,17 @@ class DroneIDEngine:
         self._wifi_eof_reason = ""
         self._wifi_restart_count = 0
         self._wifi_last_restart_at = None
+
+        # Channel scheduler — created for all modes; only starts a thread for
+        # scan/adaptive.  Fixed mode records state for status reporting only.
+        self._channel_scheduler = ChannelScheduler(
+            interface=self._interface,
+            channels=channels,
+            dwell_s=channel_dwell_ms / 1000.0,
+            mode=channel_mode,
+            expiry_s=float(channel_expiry_s),
+        )
+        self._channel_scheduler.start()
 
         # Start WiFi capture (proc + parse thread)
         self._start_wifi_capture()
@@ -1078,6 +1133,12 @@ class DroneIDEngine:
         Takes _wifi_restart_lock so restart_wifi_capture() can't race with
         us on teardown.
         """
+        # Stop channel scheduler before releasing the lock so it does not
+        # attempt a channel change while the interface is being torn down.
+        if self._channel_scheduler is not None:
+            self._channel_scheduler.stop()
+            self._channel_scheduler = None
+
         with self._wifi_restart_lock:
             self._monitoring = False
             self._stop_wifi_capture()
@@ -1158,6 +1219,9 @@ class DroneIDEngine:
                         self._interface[:-3] if self._interface.endswith('mon') else self._interface,
                         self._channel,
                     )
+                    # Notify scheduler of any VIF name change after full reset
+                    if self._channel_scheduler is not None:
+                        self._channel_scheduler.set_interface(self._interface)
                 except Exception as exc:
                     logging.error("restart_wifi_capture full: start_monitor error: %s", exc)
                     # Interface may be unavailable; note the error but proceed
@@ -1354,7 +1418,20 @@ class DroneIDEngine:
         if rt_len > len(pkt_data):
             return
 
-        rssi = self._extract_radiotap_rssi(pkt_data[:rt_len])
+        rt_data = pkt_data[:rt_len]
+        rssi = self._extract_radiotap_rssi(rt_data)
+
+        # Prefer the frequency embedded in the radiotap header over the
+        # scheduler's notion of the current channel.  This avoids
+        # mis-attributing a packet to a new channel when the interface
+        # changed channels while the packet was still in the pcap buffer.
+        rt_freq = self._extract_radiotap_channel_freq(rt_data)
+        if rt_freq:
+            pkt_channel = freq_to_channel(rt_freq) or self._get_current_channel()
+            pkt_frequency = rt_freq
+        else:
+            pkt_channel = self._get_current_channel()
+            pkt_frequency = channel_to_freq(pkt_channel)
 
         # 802.11 frame starts after radiotap header
         frame = pkt_data[rt_len:]
@@ -1365,7 +1442,12 @@ class DroneIDEngine:
         sa_bytes = frame[10:16]
         mac = ':'.join(f'{b:02x}' for b in sa_bytes)
 
-        header_info = {'rssi': rssi, 'mac': mac}
+        header_info = {
+            'rssi': rssi,
+            'mac': mac,
+            'channel': pkt_channel,
+            'frequency': pkt_frequency,
+        }
         self._process_frame(frame, header_info)
 
     @staticmethod
@@ -1400,6 +1482,49 @@ class DroneIDEngine:
 
         return 0
 
+    @staticmethod
+    def _extract_radiotap_channel_freq(rt_data: bytes) -> int:
+        """Extract the channel centre frequency (MHz) from a radiotap header.
+
+        Reads the Channel field (radiotap bit 3): a 2-byte LE frequency value
+        followed by 2 bytes of channel flags.  Returns 0 if the field is
+        absent or the header is malformed.
+        """
+        if len(rt_data) < 8:
+            return 0
+
+        present = struct.unpack_from('<I', rt_data, 4)[0]
+
+        # Skip extended present-flag words
+        offset = 4
+        p = present
+        while p & (1 << 31):
+            offset += 4
+            if offset + 4 > len(rt_data):
+                return 0
+            p = struct.unpack_from('<I', rt_data, offset)[0]
+        offset += 4  # past last present word
+
+        # Walk fields in order; stop at bit 3 (Channel)
+        for bit, size, align in _RT_FIELD_INFO:
+            if not (present & (1 << bit)):
+                continue
+            if align > 1:
+                offset = (offset + align - 1) & ~(align - 1)
+            if bit == _RT_BIT_CHANNEL:
+                if offset + 2 <= len(rt_data):
+                    return struct.unpack_from('<H', rt_data, offset)[0]
+                return 0
+            offset += size
+
+        return 0
+
+    def _get_current_channel(self) -> int:
+        """Return the current channel from the scheduler or the static setting."""
+        if self._channel_scheduler is not None:
+            return self._channel_scheduler.get_current_channel()
+        return self._channel
+
     def _process_frame(self, frame_bytes, header_info):
         """Identify frame type and extract ODID data."""
         if len(frame_bytes) < 2:
@@ -1422,13 +1547,21 @@ class DroneIDEngine:
         if device is None or not device.get_key():
             return
 
-        # Populate RF metadata from tcpdump header
+        # Populate RF metadata.  Channel and frequency come from the radiotap
+        # header (preferred) or the scheduler's current channel (fallback),
+        # both resolved in _process_pcap_frame and carried in header_info.
         device.rssi = header_info.get('rssi', 0)
         device.mac_address = header_info.get('mac', '')
-        device.channel = self._channel
-        device.frequency = 2437 if self._channel == 6 else 2412 + (self._channel - 1) * 5
+        device.channel = header_info.get('channel', self._get_current_channel())
+        device.frequency = header_info.get('frequency', channel_to_freq(device.channel))
 
         self._droneid_frame_count += 1
+
+        # Notify the channel scheduler so adaptive mode can prioritise the
+        # channel on which this valid Remote ID frame was received.
+        if self._channel_scheduler is not None:
+            self._channel_scheduler.notify_detection(device.channel)
+
         self._track_device(device)
 
     def _track_device(self, device: DroneIDDevice):
@@ -2076,10 +2209,27 @@ class DroneIDEngine:
             1,
         )
 
+        # Channel scheduler status
+        if self._channel_scheduler is not None:
+            sched = self._channel_scheduler.get_status()
+            current_channel = sched['current_channel']
+            channel_hop_mode = sched['mode']
+            channel_hop_channels = sched['channels']
+            channel_hop_dwell_s = sched['dwell_s']
+            channel_hop_active = sched['active_channels']
+            channel_hop_error = sched['last_error']
+        else:
+            current_channel = self._channel
+            channel_hop_mode = ChannelMode.FIXED
+            channel_hop_channels = [self._channel]
+            channel_hop_dwell_s = 0.0
+            channel_hop_active = {}
+            channel_hop_error = ''
+
         return {
             'monitoring': self._monitoring,
             'interface': self._interface,
-            'channel': self._channel,
+            'channel': current_channel,
             'started_at': self._started_at.isoformat().replace('+00:00', 'Z') if self._started_at else None,
             'duration_seconds': duration,
             'frame_count': self._frame_count,
@@ -2095,6 +2245,12 @@ class DroneIDEngine:
             'wifi_last_frame_age_s': last_frame_age,
             'parse_thread_alive': parse_alive,
             'tcpdump_alive': tcpdump_alive,
+            # Channel hopping fields
+            'channel_hop_mode': channel_hop_mode,
+            'channel_hop_channels': channel_hop_channels,
+            'channel_hop_dwell_s': channel_hop_dwell_s,
+            'channel_hop_active_channels': channel_hop_active,
+            'channel_hop_error': channel_hop_error,
             # BLE fields
             'ble_enabled': self._ble_enabled,
             'ble_frame_count': self._ble_frame_count,
